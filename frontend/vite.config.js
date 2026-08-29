@@ -2,6 +2,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+// "/api/*" is proxied to the FastAPI backend and the "/api" prefix is stripped,
+// so the frontend calls "/api/start_lecture" -> "http://localhost:8000/start_lecture".
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -10,9 +12,8 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
-        ws: true, // <-- enable websocket proxying
-        rewrite: (path) => path.replace(/^\/api/, "")
-      }
-    }
-  }
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+    },
+  },
 });

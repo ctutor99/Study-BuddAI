@@ -1,7 +1,5 @@
 fastapi
 uvicorn[standard]
-openai
+google-genai
 python-dotenv
-aiofiles
-requests
 python-multipart

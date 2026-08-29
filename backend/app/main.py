@@ -1,213 +1,221 @@
 # backend/app/main.py
 from dotenv import load_dotenv
+
 load_dotenv()
 
-import os
-import time
-import tempfile
-import uuid
-import threading
+import asyncio
 import json
+import os
+import uuid
 from pathlib import Path
-from typing import Optional, Any
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
-# Local wrappers you already have
-from .stt import transcribe_audio
-from .chat import summarize_text, call_chat  # call_chat expected to return text
+from .llm import generate_json, summarize_text, transcribe_audio_bytes
 
 app = FastAPI(title="Study BuddAI Backend")
 
-# Data directories
+# CORS so the app works with or without the Vite dev proxy (and in production).
+_frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_frontend_origin, "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Data directory (kept for parity with the rest of the app; the live flow keeps
+# audio in memory rather than on disk).
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory sessions store (simple)
+# A single ~5s audio chunk is tiny; cap well above that to reject junk.
+MAX_CHUNK_BYTES = 8 * 1024 * 1024
+
+# In-memory session store. Single-process demo; sessions are lost on reload.
 sessions: dict = {}
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def extract_json_from_text(text: str) -> Optional[Any]:
-    """
-    Try to extract JSON from model output robustly.
-    Returns parsed Python object or None on failure.
-    """
-    if not isinstance(text, str) or not text.strip():
-        return None
+SYSTEM_TA = "You are a teaching assistant. Output valid JSON only."
 
-    # Try direct JSON parse
+
+class StartLecture(BaseModel):
+    title: str = "untitled"
+
+
+def _new_session(title: str) -> str:
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {
+        "status": "recording",
+        "title": title,
+        "transcript": "",
+        "live_questions": [],
+        "summary": None,
+        "error": None,
+        "queue": None,
+        "chunks": 0,
+        "task": None,
+    }
+    return session_id
+
+
+def _queue(s: dict) -> asyncio.Queue:
+    """The SSE fan-out queue for a session, created on first use inside the loop."""
+    q = s.get("queue")
+    if q is None:
+        q = asyncio.Queue()
+        s["queue"] = q
+    return q
+
+
+async def _emit(s: dict, event: dict) -> None:
+    await _queue(s).put(event)
+
+
+async def _questions_for(new_text: str, context: str) -> list:
+    """Generate 1-2 comprehension questions about the newest passage of transcript."""
+    prompt = (
+        "A lecture is in progress. Earlier context is given for reference; write "
+        "questions about the LATEST passage only.\n\n"
+        f"Earlier context:\n{context[-1500:]}\n\n"
+        f"Latest passage:\n{new_text}\n\n"
+        "Return a JSON array of 1-2 objects with fields {question, answer, "
+        "difficulty}. If the latest passage has no substantive content, return []."
+    )
     try:
-        return json.loads(text)
+        items = await asyncio.to_thread(generate_json, prompt, system=SYSTEM_TA)
     except Exception:
-        pass
+        return []
+    return items if isinstance(items, list) else []
 
-    # Try to find fenced block ```json ... ```
-    import re, ast
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
-    payload = None
-    if m:
-        payload = m.group(1).strip()
-    else:
-        # Try first JSON array/object in text
-        m2 = re.search(r"(\{[\s\S]*?\}|\[[\s\S]*?\])", text)
-        if m2:
-            payload = m2.group(1).strip()
-
-    if not payload:
-        return None
-
-    # Try JSON loads, then ast literal_eval
-    try:
-        return json.loads(payload)
-    except Exception:
-        try:
-            return ast.literal_eval(payload)
-        except Exception:
-            return None
 
 # -----------------------------
 # API endpoints
 # -----------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.post("/start_lecture")
-def start_lecture(title: str = "untitled"):
-    """
-    Create a new lecture session and return session_id.
-    """
-    session_id = str(uuid.uuid4())
-    file_path = DATA_DIR / f"{session_id}.webm"
-    sessions[session_id] = {
-        "file": str(file_path),
-        "status": "recording",
-        "title": title,
-        "chunks": 0,
-        "transcript": None,
-        "summary": None,
-        "engagement_questions": None,
-        "prof_questions": None,
-        "error": None,
-    }
-    return {"session_id": session_id}
+def start_lecture(body: StartLecture):
+    """Create a new lecture session and return its id."""
+    return {"session_id": _new_session(body.title)}
+
 
 @app.post("/upload_chunk/{session_id}")
 async def upload_chunk(session_id: str, file: UploadFile = File(...)):
     """
-    Append an uploaded chunk to the session's assembled file.
-    This endpoint treats each POST as an append; the client uploads blobs (webm).
+    Accept one standalone audio chunk, transcribe it, append it to the running
+    transcript, and generate questions about it. Emits SSE events as it goes.
+
+    The response is returned only after transcription completes, so the client can
+    await the final chunk before calling /end_lecture.
     """
     s = sessions.get(session_id)
     if not s:
         return JSONResponse(status_code=404, content={"error": "session not found"})
 
-    chunk_bytes = await file.read()
-    if not chunk_bytes:
-        return JSONResponse(status_code=400, content={"error": "empty chunk"})
+    data = await file.read()
+    if not data:
+        return {"ok": True, "transcribed": ""}
+    if len(data) > MAX_CHUNK_BYTES:
+        return JSONResponse(status_code=413, content={"error": "chunk too large"})
 
-    target = Path(s["file"])
-    target.parent.mkdir(parents=True, exist_ok=True)
+    s["chunks"] += 1
+    mime = file.content_type or "audio/webm"
 
     try:
-        with open(target, "ab") as fh:
-            fh.write(chunk_bytes)
+        text = (await asyncio.to_thread(transcribe_audio_bytes, data, mime) or "").strip()
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"error": f"failed to write chunk: {str(exc)}"})
+        await _emit(s, {"type": "error", "error": f"transcription failed: {exc}"})
+        return JSONResponse(status_code=502, content={"error": str(exc)})
 
-    s["chunks"] = s.get("chunks", 0) + 1
-    return {"ok": True, "chunks": s["chunks"]}
+    if not text:
+        return {"ok": True, "transcribed": ""}
 
-def _generate_postlecture_materials(session_id: str):
-    """
-    Runs in background (thread). Transcribes, summarizes, and generates questions.
-    """
+    prior = s["transcript"]
+    s["transcript"] = f"{prior} {text}".strip() if prior else text
+    await _emit(s, {"type": "transcript", "delta": text, "full": s["transcript"]})
+
+    items = await _questions_for(text, prior)
+    if items:
+        s["live_questions"].extend(items)
+        await _emit(s, {"type": "questions", "items": items})
+
+    return {"ok": True, "transcribed": text}
+
+
+@app.get("/events/{session_id}")
+async def events(session_id: str):
+    """Server-Sent Events stream of transcript deltas, questions, and the summary."""
     s = sessions.get(session_id)
     if not s:
-        return
+        return JSONResponse(status_code=404, content={"error": "session not found"})
 
-    assembled_path = Path(s["file"])
-    if not assembled_path.exists() or assembled_path.stat().st_size == 0:
-        s["status"] = "error"
-        s["error"] = "No audio uploaded."
-        return
+    async def stream():
+        q = _queue(s)
+        # Replay current state so a late or reconnecting subscriber catches up.
+        yield f"data: {json.dumps({'type': 'transcript', 'delta': '', 'full': s['transcript']})}\n\n"
+        if s["live_questions"]:
+            yield f"data: {json.dumps({'type': 'questions', 'items': s['live_questions']})}\n\n"
+        if s["summary"]:
+            yield f"data: {json.dumps({'type': 'summary', 'summary': s['summary']})}\n\n"
+        while True:
+            try:
+                item = await asyncio.wait_for(q.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            yield f"data: {json.dumps(item)}\n\n"
+            if item.get("type") in ("done", "error"):
+                break
 
-    s["status"] = "transcribing"
-    try:
-        transcript = transcribe_audio(str(assembled_path)) or ""
-        s["transcript"] = transcript
-    except Exception as exc:
-        s["status"] = "error"
-        s["error"] = f"Transcription failed: {str(exc)}"
-        return
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
-    s["status"] = "summarizing"
-    try:
-        summary = summarize_text(s["transcript"])
-        s["summary"] = summary if isinstance(summary, str) else str(summary)
-    except Exception as exc:
-        s["status"] = "error"
-        s["error"] = f"Summarization failed: {str(exc)}"
-        return
-
-    # Generate engagement and professor questions using call_chat; parse strictly
-    try:
-        # Engagement Qs
-        model = os.getenv("OPENAI_QUICK_MODEL", "gpt-3.5-turbo")
-        prompt_e = (
-            "Return ONLY a JSON array of 6 objects with fields {question, answer, difficulty}. "
-            "Create short comprehension questions based on the transcript. Transcript:\n\n"
-            + s["transcript"]
-        )
-        messages_e = [
-            {"role": "system", "content": "You are a teacher assistant. Output valid JSON only."},
-            {"role": "user", "content": prompt_e}
-        ]
-        gen_e = call_chat(model, messages_e, max_tokens=400, temperature=0.0)
-        parsed_e = extract_json_from_text(gen_e)
-        s["engagement_questions"] = parsed_e if parsed_e is not None else [{"raw": gen_e}]
-    except Exception:
-        s["engagement_questions"] = None
-
-    try:
-        # Prof questions
-        prompt_p = (
-            "Return ONLY a JSON array of 6 objects with fields {question, intent}. "
-            "Generate questions a student could ask the professor to probe deeper. Transcript:\n\n"
-            + s["transcript"]
-        )
-        messages_p = [
-            {"role": "system", "content": "You are a teacher assistant. Output valid JSON only."},
-            {"role": "user", "content": prompt_p}
-        ]
-        gen_p = call_chat(model, messages_p, max_tokens=400, temperature=0.0)
-        parsed_p = extract_json_from_text(gen_p)
-        s["prof_questions"] = parsed_p if parsed_p is not None else [{"raw": gen_p}]
-    except Exception:
-        s["prof_questions"] = None
-
-    s["status"] = "done"
 
 @app.post("/end_lecture/{session_id}")
-def end_lecture(session_id: str, background_tasks: BackgroundTasks):
-    """
-    Signal that recording is finished; trigger background processing.
-    """
+async def end_lecture(session_id: str):
+    """Stop the lecture and summarize the full transcript in the background."""
     s = sessions.get(session_id)
     if not s:
         return JSONResponse(status_code=404, content={"error": "session not found"})
+    if s["status"] in ("summarizing", "done"):
+        return {"ok": True, "status": s["status"]}
 
-    s["status"] = "processing"
-    # Process in a background thread to avoid blocking uvicorn loop
-    def run_process():
-        _generate_postlecture_materials(session_id)
+    s["status"] = "summarizing"
+    await _emit(s, {"type": "status", "status": "summarizing"})
+    s["task"] = asyncio.create_task(_finalize(session_id))
+    return {"ok": True, "status": "summarizing"}
 
-    thread = threading.Thread(target=run_process, daemon=True)
-    thread.start()
-    return {"ok": True, "status": "processing"}
+
+async def _finalize(session_id: str) -> None:
+    s = sessions.get(session_id)
+    if not s:
+        return
+    try:
+        summary = await asyncio.to_thread(summarize_text, s["transcript"])
+    except Exception as exc:
+        s["status"] = "error"
+        s["error"] = str(exc)
+        await _emit(s, {"type": "error", "error": f"summary failed: {exc}"})
+        return
+    s["summary"] = summary
+    s["status"] = "done"
+    await _emit(s, {"type": "summary", "summary": summary})
+    await _emit(s, {"type": "done"})
+
 
 @app.get("/results/{session_id}")
 def results(session_id: str):
+    """Snapshot of a session, for a fresh load or as an SSE fallback."""
     s = sessions.get(session_id)
     if not s:
         return JSONResponse(status_code=404, content={"error": "session not found"})
@@ -215,51 +223,6 @@ def results(session_id: str):
         "status": s.get("status"),
         "transcript": s.get("transcript"),
         "summary": s.get("summary"),
-        "engagement_questions": s.get("engagement_questions"),
-        "prof_questions": s.get("prof_questions"),
+        "live_questions": s.get("live_questions"),
         "error": s.get("error"),
     }
-
-# Optional: export flashcards endpoint (CSV)
-@app.get("/export_flashcards/{session_id}")
-def export_flashcards(session_id: str):
-    s = sessions.get(session_id)
-    if not s:
-        return JSONResponse(status_code=404, content={"error": "session not found"})
-    if s.get("status") != "done" or not s.get("transcript"):
-        return JSONResponse(status_code=400, content={"error": "transcript not ready; wait until status=done"})
-
-    transcript = s["transcript"]
-    prompt = (
-        "Return ONLY a JSON array (max 40) of flashcards with fields: question, answer, difficulty (easy/medium/hard), topic. "
-        "Transcript:\n\n" + transcript
-    )
-    try:
-        model = os.getenv("OPENAI_QUICK_MODEL", "gpt-3.5-turbo")
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant that returns valid JSON only."},
-            {"role": "user", "content": prompt}
-        ]
-        gen = call_chat(model, messages, max_tokens=800, temperature=0.0)
-        cards = extract_json_from_text(gen)
-    except Exception as exc:
-        return JSONResponse(status_code=500, content={"error": f"model call failed: {str(exc)}"})
-
-    if not isinstance(cards, list):
-        return JSONResponse(status_code=500, content={"error": "failed to parse flashcards JSON", "raw": gen})
-
-    # Build CSV
-    import io, csv
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["question", "answer", "difficulty", "topic"])
-    for c in cards:
-        if isinstance(c, dict):
-            q = c.get("question", "").replace("\n", " ").strip()
-            a = c.get("answer", "").replace("\n", " ").strip()
-            d = c.get("difficulty", "medium")
-            t = c.get("topic", "")
-            writer.writerow([q, a, d, t])
-    output.seek(0)
-    headers = {"Content-Disposition": f'attachment; filename="flashcards_{session_id}.csv"'}
-    return StreamingResponse(output, media_type="text/csv", headers=headers)

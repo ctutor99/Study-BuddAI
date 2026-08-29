@@ -1,34 +1,150 @@
 // src/App.jsx
-import React, { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { API_BASE, apiFetch } from "./api";
 import "./App.css";
 
 /**
- * Minimal frontend for Study BuddAI - Post-lecture mode.
- * - Start recording (browser mic)
- * - Stop & upload (single assembled blob)
- * - Poll results until status=done
- *
- * Note: endpoints match the backend at /start_lecture, /upload_chunk/{id}, /end_lecture/{id}
+ * Study BuddAI — live mode.
+ * Record the mic in short standalone chunks and upload each one as it's produced.
+ * The backend transcribes every chunk, streams the growing transcript plus
+ * questions back over SSE, and only summarizes the whole lecture on "End".
  */
+
+const CHUNK_MS = 5000;
+const BUSY = new Set(["recording", "summarizing"]);
+
+function pickMime() {
+  if (
+    typeof MediaRecorder !== "undefined" &&
+    MediaRecorder.isTypeSupported &&
+    MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+  ) {
+    return "audio/webm;codecs=opus";
+  }
+  return "audio/webm";
+}
 
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [status, setStatus] = useState("idle");
   const [transcript, setTranscript] = useState("");
-  const [summary, setSummary] = useState("");
-  const [engagement, setEngagement] = useState(null);
-  const [profQuestions, setProfQuestions] = useState(null);
+  const [questions, setQuestions] = useState([]);
+  const [summary, setSummary] = useState(null);
   const [error, setError] = useState(null);
 
-  const mediaRecorderRef = useRef(null);
-  const chunksRef = useRef([]);
+  const sessionIdRef = useRef(null);
+  const recordingRef = useRef(false);
   const streamRef = useRef(null);
-  const pollRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const lastUploadRef = useRef(Promise.resolve());
+  const esRef = useRef(null);
+
+  // Tear down on unmount.
+  useEffect(() => {
+    return () => {
+      recordingRef.current = false;
+      esRef.current?.close();
+      stopStream();
+    };
+  }, []);
+
+  function stopStream() {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+  }
+
+  function subscribe(id) {
+    const es = new EventSource(`${API_BASE}/events/${id}`);
+    esRef.current = es;
+    es.onmessage = (ev) => {
+      let m;
+      try {
+        m = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      switch (m.type) {
+        case "transcript":
+          setTranscript(m.full);
+          break;
+        case "questions":
+          setQuestions((q) => [...q, ...m.items]);
+          break;
+        case "status":
+          setStatus(m.status);
+          break;
+        case "summary":
+          setSummary(m.summary);
+          break;
+        case "done":
+          setStatus("done");
+          es.close();
+          break;
+        case "error":
+          setError(m.error);
+          setStatus("error");
+          es.close();
+          break;
+        default:
+          break;
+      }
+    };
+    // EventSource reconnects on its own; nothing to do on transient errors.
+    es.onerror = () => {};
+  }
+
+  async function uploadChunk(blob) {
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, "chunk.webm");
+      await apiFetch(`/upload_chunk/${sessionIdRef.current}`, { method: "POST", body: fd });
+    } catch (err) {
+      console.error("chunk upload failed", err);
+    }
+  }
+
+  // Record exactly one chunk, then (if still recording) start the next one.
+  // Each stop/start cycle yields a self-contained webm the backend can decode.
+  function recordOneChunk() {
+    const stream = streamRef.current;
+    if (!stream) return;
+
+    const mr = new MediaRecorder(stream, { mimeType: pickMime() });
+    mediaRecorderRef.current = mr;
+    const parts = [];
+
+    mr.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) parts.push(e.data);
+    };
+    mr.onstop = () => {
+      const blob = new Blob(parts, { type: "audio/webm" });
+      lastUploadRef.current = blob.size > 0 ? uploadChunk(blob) : Promise.resolve();
+      if (recordingRef.current) {
+        lastUploadRef.current.finally(() => {
+          if (recordingRef.current) recordOneChunk();
+        });
+      }
+    };
+    mr.onerror = (ev) => {
+      console.error("MediaRecorder error", ev);
+      setError("Recording error");
+      setStatus("error");
+    };
+
+    mr.start();
+    setTimeout(() => {
+      if (mr.state !== "inactive") mr.stop();
+    }, CHUNK_MS);
+  }
 
   async function startLecture() {
     setError(null);
+    setTranscript("");
+    setQuestions([]);
+    setSummary(null);
+
     try {
-      const resp = await fetch("/start_lecture", {
+      const resp = await apiFetch("/start_lecture", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: "Lecture " + new Date().toISOString() }),
@@ -36,33 +152,40 @@ export default function App() {
       const j = await resp.json();
       if (!j.session_id) throw new Error("start_lecture failed");
       setSessionId(j.session_id);
+      sessionIdRef.current = j.session_id;
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      subscribe(j.session_id);
 
-      const mime = MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-      const mr = new MediaRecorder(stream, { mimeType: mime });
+      recordingRef.current = true;
+      setStatus("recording");
+      recordOneChunk();
+    } catch (err) {
+      console.error(err);
+      stopStream();
+      recordingRef.current = false;
+      setError(String(err));
+      setStatus("error");
+    }
+  }
 
-      mediaRecorderRef.current = mr;
-      chunksRef.current = [];
+  async function endLecture() {
+    if (!recordingRef.current) return;
+    recordingRef.current = false;
+    setStatus("summarizing");
 
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
-      };
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== "inactive") mr.stop(); // fires onstop -> final upload
+    stopStream();
 
-      mr.onstart = () => setStatus("recording");
-      mr.onerror = (ev) => {
-        console.error("MediaRecorder error", ev);
-        setError("Recording error");
-        setStatus("error");
-      };
+    // Wait for onstop to register the final upload, then for it to finish so the
+    // backend has the complete transcript before it summarizes.
+    await new Promise((r) => setTimeout(r, 100));
+    await lastUploadRef.current;
 
-      // timeslice ensures dataavailable events arrive regularly
-      mr.start(1000);
+    try {
+      const end = await apiFetch(`/end_lecture/${sessionIdRef.current}`, { method: "POST" });
+      if (!end.ok) throw new Error("end_lecture failed: " + (await end.text()));
     } catch (err) {
       console.error(err);
       setError(String(err));
@@ -70,180 +193,109 @@ export default function App() {
     }
   }
 
-  async function stopLectureAndUpload() {
-    if (!mediaRecorderRef.current) {
-      setError("No active recording");
-      return;
-    }
-    setError(null);
-    setStatus("uploading");
-
-    // stop recorder and wait briefly for last chunk
+  function cancel() {
+    recordingRef.current = false;
+    const mr = mediaRecorderRef.current;
     try {
-      const mr = mediaRecorderRef.current;
-      await new Promise((resolve) => {
-        mr.onstop = () => setTimeout(resolve, 120);
-        try {
-          if (mr.state !== "inactive") mr.stop();
-          else resolve();
-        } catch (e) {
-          resolve();
-        }
-      });
-    } catch (err) {
-      console.warn("stop_wait error", err);
+      if (mr && mr.state !== "inactive") mr.stop();
+    } catch {
+      /* ignore */
     }
-
-    // stop tracks
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-    }
-
-    const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-    if (!blob || blob.size === 0) {
-      setError("Recorded file is empty.");
-      setStatus("error");
-      return;
-    }
-
-    try {
-      // upload assembled blob as a single chunk (server appends)
-      const fd = new FormData();
-      fd.append("file", blob, "lecture.webm");
-      const up = await fetch(`/upload_chunk/${sessionId}`, { method: "POST", body: fd });
-      if (!up.ok) {
-        const txt = await up.text();
-        throw new Error("upload failed: " + txt);
-      }
-
-      // signal processing
-      setStatus("processing");
-      const end = await fetch(`/end_lecture/${sessionId}`, { method: "POST" });
-      if (!end.ok) {
-        const txt = await end.text();
-        throw new Error("end_lecture failed: " + txt);
-      }
-
-      // poll results
-      pollRef.current = setInterval(async () => {
-        try {
-          const r = await fetch(`/results/${sessionId}`);
-          if (!r.ok) return;
-          const j = await r.json();
-          if (j.status === "done") {
-            clearInterval(pollRef.current);
-            setStatus("done");
-            setTranscript(j.transcript || "");
-            setSummary(j.summary || "");
-            setEngagement(j.engagement_questions || null);
-            setProfQuestions(j.prof_questions || null);
-          } else if (j.status === "error") {
-            clearInterval(pollRef.current);
-            setStatus("error");
-            setError(j.error || "processing error");
-          } else {
-            setStatus(j.status || "processing");
-          }
-        } catch (err) {
-          console.error("poll error", err);
-        }
-      }, 2500);
-    } catch (err) {
-      console.error(err);
-      setError(String(err));
-      setStatus("error");
-    } finally {
-      // clean local recording state
-      mediaRecorderRef.current = null;
-      chunksRef.current = [];
-      streamRef.current = null;
-    }
-  }
-
-  function cancelRecording() {
-    try {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
-    } catch (e) { /* ignore */ }
-    mediaRecorderRef.current = null;
-    streamRef.current = null;
-    chunksRef.current = [];
+    esRef.current?.close();
+    stopStream();
     setSessionId(null);
+    sessionIdRef.current = null;
     setStatus("idle");
     setError(null);
   }
 
-  async function downloadFlashcards() {
-    if (!sessionId) return;
-    const resp = await fetch(`/export_flashcards/${sessionId}`);
-    if (!resp.ok) {
-      const txt = await resp.text();
-      alert("Export failed: " + txt);
-      return;
-    }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `flashcards_${sessionId}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
+  const busy = BUSY.has(status);
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900 }}>
-      <h1>Study BuddAI — Post-lecture</h1>
+    <div className="app">
+      <header>
+        <h1>Study BuddAI</h1>
+        <p className="tagline">
+          Live transcript and questions while you record; a full summary when you press End.
+        </p>
+      </header>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button onClick={startLecture} disabled={status === "recording" || status === "uploading" || status === "processing"}>
+      <div className="controls">
+        <button onClick={startLecture} disabled={busy}>
           Start Lecture
         </button>
-
-        <button onClick={stopLectureAndUpload} disabled={status !== "recording"}>
-          Stop & Upload
+        <button onClick={endLecture} disabled={status !== "recording"}>
+          End
         </button>
-
-        <button onClick={cancelRecording} disabled={status !== "recording"}>
+        <button className="secondary" onClick={cancel} disabled={status === "idle"}>
           Cancel
         </button>
-
-        <button onClick={downloadFlashcards} disabled={status !== "done"}>
-          Download Flashcards (CSV)
-        </button>
       </div>
 
-      <div style={{ marginBottom: 12 }}>
-        <strong>Session:</strong> {sessionId || "none"} <br />
-        <strong>Status:</strong> {status} {error ? <span style={{ color: "red" }}> — {error}</span> : null}
+      <div className="statusbar">
+        {status === "recording" && <span className="rec-dot" aria-hidden="true" />}
+        <span>
+          <strong>Status:</strong> {status}
+        </span>
+        {sessionId && <span className="muted">session {sessionId.slice(0, 8)}</span>}
+        {error && <span className="err"> — {error}</span>}
       </div>
 
-      <div style={{ marginTop: 12 }}>
-        <h3>Summary</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 10, minHeight: 80 }}>
-          {status === "done" ? (summary || "No summary") : "No summary yet"}
-        </pre>
+      <section>
+        <h2>Summary</h2>
+        {summary && summary.text ? (
+          <>
+            <p>{summary.text}</p>
+            {summary.bullets?.length > 0 && (
+              <ul>
+                {summary.bullets.map((b, i) => (
+                  <li key={i}>{b}</li>
+                ))}
+              </ul>
+            )}
+          </>
+        ) : (
+          <p className="muted">
+            {status === "summarizing" ? "Summarizing…" : "Generated when you press End."}
+          </p>
+        )}
+      </section>
 
-        <h3>Transcript</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#f7f7f7", padding: 10, maxHeight: 300, overflow: "auto" }}>
-          {status === "done" ? (transcript || "No transcript") : "No transcript yet"}
+      <section>
+        <h2>Live Transcript</h2>
+        <pre className="transcript">
+          {transcript || (status === "recording" ? "Listening…" : "Not started.")}
         </pre>
+      </section>
 
-        <h3>Engagement Questions</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#fff", padding: 10 }}>
-          {engagement ? JSON.stringify(engagement, null, 2) : "No engagement questions yet"}
-        </pre>
-
-        <h3>Questions to Ask the Professor</h3>
-        <pre style={{ whiteSpace: "pre-wrap", background: "#fff", padding: 10 }}>
-          {profQuestions ? JSON.stringify(profQuestions, null, 2) : "No professor questions yet"}
-        </pre>
-      </div>
+      <section>
+        <h2>Questions ({questions.length})</h2>
+        <QuestionList
+          items={questions}
+          empty={status === "recording" ? "Waiting for enough transcript…" : "None yet."}
+          renderMeta={(q) => q.answer && <div className="answer">{q.answer}</div>}
+          renderTag={(q) => q.difficulty}
+        />
+      </section>
     </div>
+  );
+}
+
+function QuestionList({ items, empty, renderMeta, renderTag }) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return <p className="muted">{empty}</p>;
+  }
+  return (
+    <ol className="questions">
+      {items.map((q, i) => (
+        <li key={i}>
+          <div className="q">
+            {q.question || JSON.stringify(q)}
+            {renderTag && renderTag(q) && <span className="tag">{renderTag(q)}</span>}
+          </div>
+          {renderMeta && renderMeta(q)}
+        </li>
+      ))}
+    </ol>
   );
 }
