@@ -1,14 +1,6 @@
-// src/App.jsx
 import { useEffect, useRef, useState } from "react";
 import { API_BASE, apiFetch } from "./api";
 import "./App.css";
-
-/**
- * Study BuddAI — live mode.
- * Record the mic in short standalone chunks and upload each one as it's produced.
- * The backend transcribes every chunk, streams the growing transcript plus
- * questions back over SSE, and only summarizes the whole lecture on "End".
- */
 
 const CHUNK_MS = 5000;
 const BUSY = new Set(["recording", "summarizing"]);
@@ -31,15 +23,16 @@ export default function App() {
   const [questions, setQuestions] = useState([]);
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
 
   const sessionIdRef = useRef(null);
   const recordingRef = useRef(false);
   const streamRef = useRef(null);
   const mediaRecorderRef = useRef(null);
-  const lastUploadRef = useRef(Promise.resolve());
+  const uploadChainRef = useRef(Promise.resolve());
+  const chunkDoneRef = useRef(Promise.resolve());
   const esRef = useRef(null);
 
-  // Tear down on unmount.
   useEffect(() => {
     return () => {
       recordingRef.current = false;
@@ -64,14 +57,25 @@ export default function App() {
         return;
       }
       switch (m.type) {
+        case "snapshot":
+          setTranscript(m.transcript || "");
+          setQuestions(Array.isArray(m.questions) ? m.questions : []);
+          setSummary(m.summary || null);
+          setError(m.error || null);
+          if (m.status) setStatus(m.status);
+          break;
         case "transcript":
           setTranscript(m.full);
+          setNotice(null);
           break;
         case "questions":
           setQuestions((q) => [...q, ...m.items]);
           break;
         case "status":
           setStatus(m.status);
+          break;
+        case "warning":
+          setNotice(m.message);
           break;
         case "summary":
           setSummary(m.summary);
@@ -89,7 +93,6 @@ export default function App() {
           break;
       }
     };
-    // EventSource reconnects on its own; nothing to do on transient errors.
     es.onerror = () => {};
   }
 
@@ -97,14 +100,21 @@ export default function App() {
     try {
       const fd = new FormData();
       fd.append("file", blob, "chunk.webm");
-      await apiFetch(`/upload_chunk/${sessionIdRef.current}`, { method: "POST", body: fd });
-    } catch (err) {
-      console.error("chunk upload failed", err);
+      await apiFetch(`/upload_chunk/${sessionIdRef.current}`, {
+        method: "POST",
+        body: fd,
+      });
+    } catch {
+      setNotice("A chunk failed to upload.");
     }
   }
 
-  // Record exactly one chunk, then (if still recording) start the next one.
-  // Each stop/start cycle yields a self-contained webm the backend can decode.
+  function enqueueUpload(blob) {
+    const done = uploadChainRef.current.then(() => uploadChunk(blob));
+    uploadChainRef.current = done.catch(() => {});
+    return done;
+  }
+
   function recordOneChunk() {
     const stream = streamRef.current;
     if (!stream) return;
@@ -113,20 +123,21 @@ export default function App() {
     mediaRecorderRef.current = mr;
     const parts = [];
 
+    let markDone;
+    chunkDoneRef.current = new Promise((resolve) => {
+      markDone = resolve;
+    });
+
     mr.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) parts.push(e.data);
     };
     mr.onstop = () => {
       const blob = new Blob(parts, { type: "audio/webm" });
-      lastUploadRef.current = blob.size > 0 ? uploadChunk(blob) : Promise.resolve();
-      if (recordingRef.current) {
-        lastUploadRef.current.finally(() => {
-          if (recordingRef.current) recordOneChunk();
-        });
-      }
+      if (blob.size > 0) enqueueUpload(blob);
+      markDone();
+      if (recordingRef.current) recordOneChunk();
     };
-    mr.onerror = (ev) => {
-      console.error("MediaRecorder error", ev);
+    mr.onerror = () => {
       setError("Recording error");
       setStatus("error");
     };
@@ -139,9 +150,12 @@ export default function App() {
 
   async function startLecture() {
     setError(null);
+    setNotice(null);
     setTranscript("");
     setQuestions([]);
     setSummary(null);
+    uploadChainRef.current = Promise.resolve();
+    chunkDoneRef.current = Promise.resolve();
 
     try {
       const resp = await apiFetch("/start_lecture", {
@@ -161,7 +175,6 @@ export default function App() {
       setStatus("recording");
       recordOneChunk();
     } catch (err) {
-      console.error(err);
       stopStream();
       recordingRef.current = false;
       setError(String(err));
@@ -175,19 +188,16 @@ export default function App() {
     setStatus("summarizing");
 
     const mr = mediaRecorderRef.current;
-    if (mr && mr.state !== "inactive") mr.stop(); // fires onstop -> final upload
-    stopStream();
+    if (mr && mr.state === "recording") mr.stop();
 
-    // Wait for onstop to register the final upload, then for it to finish so the
-    // backend has the complete transcript before it summarizes.
-    await new Promise((r) => setTimeout(r, 100));
-    await lastUploadRef.current;
+    await chunkDoneRef.current;
+    stopStream();
+    await uploadChainRef.current;
 
     try {
       const end = await apiFetch(`/end_lecture/${sessionIdRef.current}`, { method: "POST" });
       if (!end.ok) throw new Error("end_lecture failed: " + (await end.text()));
     } catch (err) {
-      console.error(err);
       setError(String(err));
       setStatus("error");
     }
@@ -196,17 +206,16 @@ export default function App() {
   function cancel() {
     recordingRef.current = false;
     const mr = mediaRecorderRef.current;
-    try {
-      if (mr && mr.state !== "inactive") mr.stop();
-    } catch {
-      /* ignore */
-    }
+    if (mr && mr.state !== "inactive") mr.stop();
     esRef.current?.close();
     stopStream();
+    uploadChainRef.current = Promise.resolve();
+    chunkDoneRef.current = Promise.resolve();
     setSessionId(null);
     sessionIdRef.current = null;
     setStatus("idle");
     setError(null);
+    setNotice(null);
   }
 
   const busy = BUSY.has(status);
@@ -238,6 +247,7 @@ export default function App() {
           <strong>Status:</strong> {status}
         </span>
         {sessionId && <span className="muted">session {sessionId.slice(0, 8)}</span>}
+        {notice && <span className="muted"> — {notice}</span>}
         {error && <span className="err"> — {error}</span>}
       </div>
 

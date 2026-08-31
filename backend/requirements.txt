@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
-google-genai
+httpx
+faster-whisper>=1.0
 python-dotenv
 python-multipart
